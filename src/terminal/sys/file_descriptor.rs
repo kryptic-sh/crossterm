@@ -64,6 +64,16 @@ impl FileDesc<'_> {
         }
     }
 
+    /// The number of bytes waiting to be read (`FIONREAD`).
+    pub fn bytes_to_read(&self) -> io::Result<u64> {
+        let mut count: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int, into `count`, which outlives the call.
+        if unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut count) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(count.max(0) as u64)
+    }
+
     /// Returns the underlying file descriptor.
     pub fn raw_fd(&self) -> RawFd {
         self.fd
@@ -79,6 +89,15 @@ impl FileDesc<'_> {
         };
         let result = rustix::io::read(fd, buffer)?;
         Ok(result)
+    }
+
+    /// The number of bytes waiting to be read (`FIONREAD`).
+    pub fn bytes_to_read(&self) -> io::Result<u64> {
+        let fd = match self {
+            FileDesc::Owned(fd) => fd.as_fd(),
+            FileDesc::Borrowed(fd) => fd.as_fd(),
+        };
+        Ok(rustix::io::ioctl_fionread(fd)?)
     }
 
     pub fn raw_fd(&self) -> RawFd {
