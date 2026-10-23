@@ -563,6 +563,20 @@ pub enum Event {
     /// An resize event with new dimensions after resize (columns, rows).
     /// **Note** that resize events can occur in batches.
     Resize(u16, u16),
+    /// The terminal's color scheme, as it reports it (`CSI ? 997 ; 1 n` dark,
+    /// `CSI ? 997 ; 2 n` light): in answer to `CSI ? 996 n`, and on each change
+    /// while DEC private mode 2031 is set.
+    ColorScheme(ColorScheme),
+}
+
+/// A terminal's color scheme (see [`Event::ColorScheme`]).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ColorScheme {
+    /// Light text on a dark background.
+    Dark,
+    /// Dark text on a light background.
+    Light,
 }
 
 impl Event {

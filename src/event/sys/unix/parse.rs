@@ -1,8 +1,9 @@
 use std::io;
 
 use crate::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
-    MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
+    ColorScheme, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    KeyboardEnhancementFlags, MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 
 use super::super::super::InternalEvent;
@@ -181,6 +182,7 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            b'n' => return parse_csi_color_scheme(buffer),
             // A final byte we have no parser for still ends the sequence.
             // Returning Ok(None) here wedges the reader and swallows later input (#1104).
             0x40..=0x7E => return Err(could_not_parse_event_error()),
@@ -302,6 +304,16 @@ fn parse_csi_primary_device_attributes(buffer: &[u8]) -> io::Result<Option<Inter
     // See <https://vt100.net/docs/vt510-rm/DA1.html>
 
     Ok(Some(InternalEvent::PrimaryDeviceAttributes))
+}
+
+fn parse_csi_color_scheme(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    // ESC [ ? 997 ; Ps n, Ps 1 dark and 2 light
+    let scheme = match buffer {
+        b"\x1B[?997;1n" => ColorScheme::Dark,
+        b"\x1B[?997;2n" => ColorScheme::Light,
+        _ => return Err(could_not_parse_event_error()),
+    };
+    Ok(Some(InternalEvent::Event(Event::ColorScheme(scheme))))
 }
 
 fn parse_modifiers(mask: u8) -> KeyModifiers {
@@ -1531,11 +1543,24 @@ mod tests {
             r.is_err(),
             "finished unrecognised CSI ? sequence must be Err, got {r:?}"
         );
-        // Color-scheme report CSI ? 997 ; 1 n
-        let r = parse_event(b"\x1B[?997;1n", false);
+        // An unknown device status report
+        let r = parse_event(b"\x1B[?998;1n", false);
         assert!(
             r.is_err(),
             "finished unrecognised CSI ? sequence must be Err, got {r:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_csi_color_scheme() {
+        assert_eq!(
+            parse_event(b"\x1B[?997;1n", false).unwrap(),
+            Some(InternalEvent::Event(Event::ColorScheme(ColorScheme::Dark))),
+        );
+        assert_eq!(
+            parse_event(b"\x1B[?997;2n", false).unwrap(),
+            Some(InternalEvent::Event(Event::ColorScheme(ColorScheme::Light))),
+        );
+        assert!(parse_event(b"\x1B[?997;3n", false).is_err());
     }
 }
