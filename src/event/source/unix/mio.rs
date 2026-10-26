@@ -21,12 +21,19 @@ const WAKE_TOKEN: Token = Token(2);
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
 
+// One readiness event for each registered source.
+const EVENTS_CAPACITY: usize = 3;
+
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
+    /// A read filled the buffer and left input in the tty, which no
+    /// readiness event will announce (mio is edge-triggered): the next pass
+    /// reads on before polling.
+    tty_pending: bool,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
@@ -53,14 +60,53 @@ impl UnixInternalEventSource {
 
         Ok(UnixInternalEventSource {
             poll,
-            events: Events::with_capacity(3),
+            events: Events::with_capacity(EVENTS_CAPACITY),
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
+            tty_pending: false,
             signals,
             #[cfg(feature = "event-stream")]
             waker,
         })
+    }
+}
+
+impl UnixInternalEventSource {
+    /// Reads the tty into the parser until it has an event, a read that
+    /// fills the buffer leaves input behind (`tty_pending`, so a caller
+    /// hands back what was parsed before reading on), or there is nothing
+    /// more to read now.
+    fn read_tty(&mut self) -> io::Result<()> {
+        loop {
+            match self.tty_fd.read(&mut self.tty_buffer) {
+                Ok(read_count) => {
+                    if read_count > 0 {
+                        self.parser.advance(
+                            &self.tty_buffer[..read_count],
+                            read_count == TTY_BUFFER_SIZE,
+                        );
+                    }
+                    self.tty_pending =
+                        read_count == TTY_BUFFER_SIZE && self.tty_fd.bytes_to_read()? > 0;
+                }
+                Err(e) => {
+                    // No more data to read at the moment. We will receive another event
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        self.tty_pending = false;
+                        return Ok(());
+                    }
+                    // once more data is available to read.
+                    else if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                }
+            };
+
+            if !self.parser.internal_events.is_empty() || self.tty_pending {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -73,6 +119,17 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
+            if self.tty_pending {
+                self.read_tty()?;
+                if let Some(event) = self.parser.next() {
+                    return Ok(Some(event));
+                }
+                if timeout.elapsed() {
+                    return Ok(None);
+                }
+                continue;
+            }
+
             if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
@@ -92,42 +149,14 @@ impl EventSource for UnixInternalEventSource {
             // mio is edge-triggered: a ready token not handled now is not
             // reported again until more input arrives on it, so every token
             // in this batch is handled before an event is returned.
-            for token in self.events.iter().map(|x| x.token()) {
+            // Taken out first, as reading the tty borrows all of `self`.
+            let mut tokens = [None; EVENTS_CAPACITY];
+            for (slot, event) in tokens.iter_mut().zip(self.events.iter()) {
+                *slot = Some(event.token());
+            }
+            for token in tokens.into_iter().flatten() {
                 match token {
-                    TTY_TOKEN => {
-                        loop {
-                            let mut full = false;
-                            match self.tty_fd.read(&mut self.tty_buffer) {
-                                Ok(read_count) => {
-                                    if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
-                                    }
-                                    full = read_count == TTY_BUFFER_SIZE;
-                                }
-                                Err(e) => {
-                                    // No more data to read at the moment. We will receive another event
-                                    if e.kind() == io::ErrorKind::WouldBlock {
-                                        break;
-                                    }
-                                    // once more data is available to read.
-                                    else if e.kind() == io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                }
-                            };
-
-                            // A full buffer may have left input in the tty, which
-                            // no new readiness event announces.
-                            if !self.parser.internal_events.is_empty()
-                                && !(full && self.tty_fd.bytes_to_read()? > 0)
-                            {
-                                break;
-                            }
-                        }
-                    }
+                    TTY_TOKEN => self.read_tty()?,
                     SIGNAL_TOKEN => {
                         if self.signals.pending().next() == Some(signal_hook::consts::SIGWINCH) {
                             // TODO Should we remove tput?
@@ -238,5 +267,69 @@ impl Iterator for Parser {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.internal_events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    use super::*;
+
+    /// A source reading what is written to the returned stream.
+    fn source() -> (UnixInternalEventSource, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        #[cfg(feature = "libc")]
+        let fd = FileDesc::new(std::os::fd::IntoRawFd::into_raw_fd(ours), true);
+        #[cfg(not(feature = "libc"))]
+        let fd = FileDesc::Owned(ours.into());
+        let source = UnixInternalEventSource::from_file_descriptor(fd).unwrap();
+        (source, theirs)
+    }
+
+    /// Every event of a burst longer than one read arrives, with no more
+    /// input to announce the rest.
+    #[test]
+    fn a_burst_longer_than_one_read_all_arrives() {
+        let (mut source, mut input) = source();
+        let burst = TTY_BUFFER_SIZE * 2 + TTY_BUFFER_SIZE / 2;
+        input.write_all(&vec![b'a'; burst]).unwrap();
+        let mut events = 0;
+        while let Some(event) = source.try_read(Some(Duration::from_millis(100))).unwrap() {
+            assert!(matches!(event, InternalEvent::Event(Event::Key(_))));
+            events += 1;
+        }
+        assert_eq!(events, burst);
+    }
+
+    /// The first event comes back after one read, not after the whole
+    /// burst is parsed, so sustained input neither delays events nor grows
+    /// the queue without bound.
+    #[test]
+    fn a_burst_is_handed_back_one_read_at_a_time() {
+        let (mut source, mut input) = source();
+        input.write_all(&vec![b'a'; TTY_BUFFER_SIZE * 4]).unwrap();
+        let first = source.try_read(Some(Duration::from_millis(100))).unwrap();
+        assert!(first.is_some());
+        assert!(source.parser.internal_events.len() < TTY_BUFFER_SIZE);
+        assert!(source.tty_pending);
+    }
+
+    /// A burst of exactly the buffer's size leaves nothing to read, and the
+    /// next call does not block on the tty.
+    #[test]
+    fn a_burst_of_exactly_one_buffer_does_not_block() {
+        let (mut source, mut input) = source();
+        input.write_all(&[b'a'; TTY_BUFFER_SIZE]).unwrap();
+        let mut events = 0;
+        while source
+            .try_read(Some(Duration::from_millis(100)))
+            .unwrap()
+            .is_some()
+        {
+            events += 1;
+        }
+        assert_eq!(events, TTY_BUFFER_SIZE);
+        assert!(!source.tty_pending);
     }
 }
