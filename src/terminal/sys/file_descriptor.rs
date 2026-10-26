@@ -64,9 +64,11 @@ impl FileDesc<'_> {
         }
     }
 
-    /// The number of bytes waiting to be read (`FIONREAD`).
+    /// The number of bytes waiting to be read (`FIONREAD`), for the mio
+    /// event source, whose readiness is edge-triggered.
+    #[cfg(all(feature = "events", not(feature = "use-dev-tty")))]
     pub fn bytes_to_read(&self) -> io::Result<u64> {
-        let mut count: libc::c_int = 0;
+        let mut count: std::os::raw::c_int = 0;
         // SAFETY: FIONREAD writes one int, into `count`, which outlives the call.
         if unsafe { libc::ioctl(self.fd, libc::FIONREAD, &mut count) } < 0 {
             return Err(io::Error::last_os_error());
