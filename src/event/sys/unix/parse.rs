@@ -1,9 +1,9 @@
 use std::io;
 
 use crate::event::{
-    ColorScheme, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    ColorScheme, ColorSlot, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
     KeyboardEnhancementFlags, MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent,
-    MouseEventKind,
+    MouseEventKind, TerminalColor,
 };
 
 use super::super::super::InternalEvent;
@@ -75,6 +75,7 @@ pub(crate) fn parse_event(
                         }
                     }
                     b'[' => parse_csi(buffer),
+                    b']' => parse_osc(buffer, input_available),
                     // Anything else, a second ESC included, is that key with Alt held:
                     // ESC ESC is Alt+Esc, and ESC ESC [ A is Alt+Up.
                     _ => parse_event(&buffer[1..], input_available).map(|event_option| {
@@ -314,6 +315,94 @@ fn parse_csi_color_scheme(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         _ => return Err(could_not_parse_event_error()),
     };
     Ok(Some(InternalEvent::Event(Event::ColorScheme(scheme))))
+}
+
+/// The longest OSC answer read before it is given up as noise.
+const MAX_OSC: usize = 256;
+
+/// `ESC ]` starts an OSC string the terminal sends in answer to a query, or
+/// is Alt+]. With nothing after it in the read it is Alt+], as before; with
+/// a number after it, the rest is read as `Ps ; Pt` up to its BEL or `ESC \`
+/// and, where it is a colour answer ([`Event::TerminalColor`]), returned as
+/// one, else dropped. Alt+] with other keys after it in the same read is
+/// Alt+] alone, the rest dropped: keys typed one at a time come in reads of
+/// their own.
+fn parse_osc(buffer: &[u8], input_available: bool) -> io::Result<Option<InternalEvent>> {
+    // ESC ]
+    let alt_bracket = || {
+        Ok(Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        )))))
+    };
+    let body = &buffer[2..];
+    if body.is_empty() {
+        return if input_available {
+            Ok(None)
+        } else {
+            alt_bracket()
+        };
+    }
+    if !body[0].is_ascii_digit() {
+        return alt_bracket();
+    }
+    // Only a colour answer's number and its `;` are read on, so keys after
+    // an Alt+] are not held for long.
+    let digits = body.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == body.len() {
+        return if digits <= 2 {
+            Ok(None)
+        } else {
+            Err(could_not_parse_event_error())
+        };
+    }
+    if body[digits] != b';' || !matches!(&body[..digits], b"4" | b"10" | b"11" | b"12") {
+        return Err(could_not_parse_event_error());
+    }
+    let text = if let Some(text) = body.strip_suffix(b"\x07") {
+        text
+    } else if let Some(text) = body.strip_suffix(b"\x1B\\") {
+        text
+    } else if body.len() > MAX_OSC || body[..body.len() - 1].contains(&b'\x1B') {
+        return Err(could_not_parse_event_error());
+    } else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(text).map_err(|_| could_not_parse_event_error())?;
+    terminal_color(text)
+        .map(|color| Some(InternalEvent::Event(Event::TerminalColor(color))))
+        .ok_or_else(could_not_parse_event_error)
+}
+
+/// A colour answer's text (`10;rgb:…`, `4;n;rgb:…`) as a [`TerminalColor`].
+fn terminal_color(text: &str) -> Option<TerminalColor> {
+    let (ps, rest) = text.split_once(';')?;
+    let (slot, spec) = match ps {
+        "10" => (ColorSlot::Foreground, rest),
+        "11" => (ColorSlot::Background, rest),
+        "12" => (ColorSlot::Cursor, rest),
+        "4" => {
+            let (n, spec) = rest.split_once(';')?;
+            (ColorSlot::Palette(n.parse().ok()?), spec)
+        }
+        _ => return None,
+    };
+    let mut channels = spec.strip_prefix("rgb:")?.split('/');
+    let mut channel = || {
+        let digits = channels.next()?;
+        if !(1..=4).contains(&digits.len()) {
+            return None;
+        }
+        let value = u32::from_str_radix(digits, 16).ok()?;
+        // X11 scales n digits to 16 bits: v * 0xffff / (16^n - 1).
+        let max = (1u32 << (4 * digits.len())) - 1;
+        u16::try_from(value * 0xffff / max).ok()
+    };
+    let rgb = (channel()?, channel()?, channel()?);
+    if channels.next().is_some() {
+        return None;
+    }
+    Some(TerminalColor { slot, rgb })
 }
 
 fn parse_modifiers(mask: u8) -> KeyModifiers {
@@ -1562,5 +1651,57 @@ mod tests {
             Some(InternalEvent::Event(Event::ColorScheme(ColorScheme::Light))),
         );
         assert!(parse_event(b"\x1B[?997;3n", false).is_err());
+    }
+
+    #[test]
+    fn test_parse_osc_terminal_color() {
+        let color = |slot, rgb| {
+            Some(InternalEvent::Event(Event::TerminalColor(TerminalColor {
+                slot,
+                rgb,
+            })))
+        };
+        assert_eq!(
+            parse_event(b"\x1B]11;rgb:1e1e/1e1e/2e2e\x1B\\", false).unwrap(),
+            color(ColorSlot::Background, (0x1e1e, 0x1e1e, 0x2e2e)),
+        );
+        // Two digits a channel, ended by a BEL.
+        assert_eq!(
+            parse_event(b"\x1B]10;rgb:ff/80/00\x07", false).unwrap(),
+            color(ColorSlot::Foreground, (0xffff, 0x8080, 0)),
+        );
+        assert_eq!(
+            parse_event(b"\x1B]12;rgb:f/0/0\x07", false).unwrap(),
+            color(ColorSlot::Cursor, (0xffff, 0, 0)),
+        );
+        assert_eq!(
+            parse_event(b"\x1B]4;1;rgb:cdcd/0000/0000\x1B\\", false).unwrap(),
+            color(ColorSlot::Palette(1), (0xcdcd, 0, 0)),
+        );
+        // Every part of an answer waits for the rest, read on or not.
+        let answer = b"\x1B]4;255;rgb:cdcd/0000/0000\x1B\\";
+        for end in 1..answer.len() {
+            assert_eq!(parse_event(&answer[..end], true).unwrap(), None, "{end}");
+            if end > 2 {
+                assert_eq!(parse_event(&answer[..end], false).unwrap(), None, "{end}");
+            }
+        }
+        // Not colour answers.
+        assert!(parse_event(b"\x1B]52;c;aGk=\x07", false).is_err());
+        assert!(parse_event(b"\x1B]11;black\x07", false).is_err());
+        assert!(parse_event(b"\x1B]11;rgb:1/2/3/4\x07", false).is_err());
+        assert!(parse_event(b"\x1B]4;256;rgb:0/0/0\x07", false).is_err());
+        assert!(parse_event(b"\x1B]1x", true).is_err());
+    }
+
+    #[test]
+    fn test_parse_esc_bracket_is_alt_bracket() {
+        let alt_bracket = Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::ALT,
+        ))));
+        assert_eq!(parse_event(b"\x1B]", false).unwrap(), alt_bracket);
+        assert_eq!(parse_event(b"\x1B]", true).unwrap(), None);
+        assert_eq!(parse_event(b"\x1B]a", false).unwrap(), alt_bracket);
     }
 }

@@ -567,6 +567,10 @@ pub enum Event {
     /// `CSI ? 997 ; 2 n` light): in answer to `CSI ? 996 n`, and on each change
     /// while DEC private mode 2031 is set.
     ColorScheme(ColorScheme),
+    /// A colour the terminal reports in answer to a query: `OSC 10 ; ?` (its
+    /// foreground), `OSC 11 ; ?` (background), `OSC 12 ; ?` (cursor) or
+    /// `OSC 4 ; n ; ?` (palette entry `n`), answered in `rgb:` form.
+    TerminalColor(TerminalColor),
 }
 
 /// A terminal's color scheme (see [`Event::ColorScheme`]).
@@ -577,6 +581,31 @@ pub enum ColorScheme {
     Dark,
     /// Dark text on a light background.
     Light,
+}
+
+/// A colour the terminal reported (see [`Event::TerminalColor`]).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct TerminalColor {
+    /// Which colour it is.
+    pub slot: ColorSlot,
+    /// Its red, green and blue, each scaled to 16 bits as X11's
+    /// `rgb:` form scales one to four hex digits.
+    pub rgb: (u16, u16, u16),
+}
+
+/// Which of the terminal's colours a [`TerminalColor`] is.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialOrd, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ColorSlot {
+    /// The default foreground (OSC 10).
+    Foreground,
+    /// The default background (OSC 11).
+    Background,
+    /// The cursor's (OSC 12).
+    Cursor,
+    /// An entry of the 256-colour palette (OSC 4).
+    Palette(u8),
 }
 
 impl Event {
